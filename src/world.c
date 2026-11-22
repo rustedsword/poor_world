@@ -17,44 +17,39 @@ static struct poor_world_version *
 version_next(const struct h_world *world)
 {
 	assert(world->next != POOR_FAN_NO_SLOT);
-	return version_at(world, world->next);
-}
-
-static void *
-node_item(const struct h_world_layout *layout, struct poor_world_node *node)
-{
-	return (unsigned char *)node - layout->node_hook;
+	return world->version;
 }
 
 static struct node_header *
 node_header(const struct h_world_layout *layout, struct poor_world_node *node)
 {
-	return (void *)((unsigned char *)node_item(layout, node) - layout->node_base);
+	return (void *)((unsigned char *)node - layout->node_header);
 }
 
 static struct poor_world_node **
 node_children(const struct h_world_layout *layout, struct poor_world_node *node)
 {
-	return (void *)((unsigned char *)node_item(layout, node) + layout->children);
+	return (void *)((unsigned char *)node + layout->node_children);
 }
 
+/* The bytes of a node's block that are in use, from the start of the block. A node is copied from there,
+ * header included, in whole cache lines: a copy that is not aligned to them measured much slower. */
 static size_t
 node_bytes(const struct h_world_layout *layout, size_t children)
 {
-	return layout->children + children * sizeof(struct poor_world_node *);
+	return layout->block_bytes + children * sizeof(struct poor_world_node *);
 }
 
 static uint32_t
 node_order(const struct h_world_layout *layout, size_t children)
 {
-	return block_order(layout->node_base + node_bytes(layout, children));
+	return block_order(node_bytes(layout, children));
 }
 
 static size_t
 node_capacity(const struct h_world_layout *layout, struct poor_world_node *node)
 {
-	return (block_bytes(node_header(layout, node)->order) - layout->node_base - layout->children)
-	       / sizeof(struct poor_world_node *);
+	return (block_bytes(node_header(layout, node)->order) - layout->block_bytes) / sizeof(struct poor_world_node *);
 }
 
 static struct poor_world_node *
@@ -68,7 +63,7 @@ node_alloc(struct h_world *world, const struct h_world_layout *layout, size_t ch
 	header->order = (uint8_t)order;
 	header->state = NODE_LIVE;
 	++world->nodes;
-	return (void *)((unsigned char *)header + layout->node_base + layout->node_hook);
+	return (void *)((unsigned char *)header + layout->node_header);
 }
 
 static void
@@ -79,7 +74,7 @@ node_free(struct h_world *world, const struct h_world_layout *layout, struct poo
 	assert(header->state != NODE_FREE);
 	header->state = NODE_FREE;
 	--world->nodes;
-	h_world_block_free(&world->memory, header, header->order);
+	h_world_block_free(&world->memory, header);
 }
 
 static struct poor_world_node *
@@ -105,14 +100,7 @@ entry_of(const struct h_world *world, uint32_t handle)
 static struct h_world_entry *
 entry_alive(const struct h_world *world, uint32_t handle)
 {
-	assert(h_world_find(world, handle) != nullptr);
-	return entry_of(world, handle);
-}
-
-static uint32_t
-pages_capacity(const struct h_world_index *index)
-{
-	return index->pages != nullptr ? (uint32_t)(block_bytes(index->order) / sizeof(struct h_world_page)) : 0;
+	return h_world_entry(world, handle);
 }
 
 static void
@@ -148,11 +136,19 @@ pages_resize(struct h_world *world, uint32_t order)
 		return false;
 	if (index->pages != nullptr) {
 		copy_array(array_ptr(pages, index->page_count), array_ptr(index->pages, index->page_count));
-		h_world_block_free(&world->memory, index->pages, index->order);
+		h_world_block_free(&world->memory, index->pages);
 	}
 	index->pages = pages;
-	index->order = (uint8_t)order;
+	index->capacity = (uint32_t)(block_bytes(order) / sizeof(struct h_world_page));
 	return true;
+}
+
+static void
+pages_drop(struct h_world *world)
+{
+	h_world_block_free(&world->memory, world->index.pages);
+	world->index.pages = nullptr;
+	world->index.capacity = 0;
 }
 
 static void
@@ -161,16 +157,13 @@ page_release(struct h_world *world, uint32_t page)
 	struct h_world_index *index = &world->index;
 
 	pages_remove(index, &index->partial, page);
-	h_world_block_free(&world->memory, index->pages[page].entries, PAGE_ORDER);
+	h_world_block_free(&world->memory, index->pages[page].entries);
 	index->pages[page].entries = nullptr;
 	pages_push(index, &index->vacant, page);
 	while (index->page_count > 0 && index->pages[index->page_count - 1].entries == nullptr)
 		pages_remove(index, &index->vacant, --index->page_count);
-	if (index->page_count == 0) {
-		h_world_block_free(&world->memory, index->pages, index->order);
-		index->pages = nullptr;
-		index->order = 0;
-	}
+	if (index->page_count == 0)
+		pages_drop(world);
 }
 
 static void
@@ -180,10 +173,10 @@ pages_fit(struct h_world *world)
 	const size_t wanted = world->memory.wanted;
 	uint32_t order;
 
-	if (index->pages == nullptr || index->page_count > pages_capacity(index) / 4)
+	if (index->page_count == 0 || index->page_count > index->capacity / 4)
 		return;
 	order = block_order(2 * (size_t)index->page_count * sizeof(struct h_world_page));
-	if (order < index->order) {
+	if (block_bytes(order) / sizeof(struct h_world_page) < index->capacity) {
 		pages_resize(world, order);
 		world->memory.wanted = wanted;
 	}
@@ -198,7 +191,7 @@ index_reserve(struct h_world *world)
 
 	if (index->partial != H_WORLD_NO_PAGE)
 		return true;
-	if (page == H_WORLD_NO_PAGE && index->page_count == pages_capacity(index)
+	if (page == H_WORLD_NO_PAGE && index->page_count == index->capacity
 	    && !pages_resize(world, block_order((2 * (size_t)index->page_count + 2) * sizeof(struct h_world_page))))
 		return false;
 	entries = h_world_block_alloc(&world->memory, PAGE_ORDER);
@@ -226,11 +219,8 @@ index_unreserve(struct h_world *world)
 
 	if (index->partial != H_WORLD_NO_PAGE && index->pages[index->partial].live == 0)
 		page_release(world, index->partial);
-	if (index->pages != nullptr && index->page_count == 0) {
-		h_world_block_free(&world->memory, index->pages, index->order);
-		index->pages = nullptr;
-		index->order = 0;
-	}
+	if (index->pages != nullptr && index->page_count == 0)
+		pages_drop(world);
 }
 
 static uint32_t
@@ -263,7 +253,7 @@ index_free(struct h_world *world, uint32_t handle)
 		page_release(world, page);
 }
 
-static uint32_t
+static inline uint32_t
 child_slot(const struct h_world_layout *layout, struct poor_world_node *parent, struct h_world_entry *entry)
 {
 	struct poor_world_node *const *children = node_children(layout, parent);
@@ -280,23 +270,6 @@ child_slot(const struct h_world_layout *layout, struct poor_world_node *parent, 
 	unreachable();
 }
 
-EXPORT struct poor_world_node *
-h_world_find(const struct h_world *world, uint32_t handle)
-{
-	const struct h_world_index *index = &world->index;
-	const uint32_t page = handle / PAGE_ENTRIES;
-
-	if (page >= index->page_count || index->pages[page].entries == nullptr)
-		return nullptr;
-	return index->pages[page].entries[handle % PAGE_ENTRIES].node;
-}
-
-EXPORT uint32_t
-h_world_parent(const struct h_world *world, uint32_t handle)
-{
-	return entry_alive(world, handle)->parent;
-}
-
 EXPORT uint32_t
 h_world_index_of(struct h_world *world, uint32_t handle)
 {
@@ -307,19 +280,22 @@ h_world_index_of(struct h_world *world, uint32_t handle)
 }
 
 /* Free slots are a ring through 'older', and the one freed first is taken first:
- * taking the one freed last measured slower while readers are active. */
+ * taking the one freed last measured slower while readers are active.
+ * 'fresh' is a slot that most likely no reader took. It is taken next: the writer still has it in its cache. */
 static void
-slot_free(struct h_world *world, uint32_t index)
+slot_free(struct h_world *world, uint32_t index, bool fresh)
 {
 	struct h_world_slot *slots = world->slots;
 
 	if (world->free_last == 0) {
 		slots[index].older = index + 1;
-	} else {
-		slots[index].older = slots[world->free_last - 1].older;
-		slots[world->free_last - 1].older = index + 1;
+		world->free_last = index + 1;
+		return;
 	}
-	world->free_last = index + 1;
+	slots[index].older = slots[world->free_last - 1].older;
+	slots[world->free_last - 1].older = index + 1;
+	if (!fresh)
+		world->free_last = index + 1;
 }
 
 static uint32_t
@@ -336,7 +312,7 @@ slot_take(struct h_world *world)
 }
 
 static void
-version_free(struct h_world *world, const struct h_world_layout *layout, uint32_t index)
+version_free(struct h_world *world, const struct h_world_layout *layout, uint32_t index, bool fresh)
 {
 	struct h_world_slot *slot = &world->slots[index];
 	struct h_world_slot *older = slot->older != 0 ? &world->slots[slot->older - 1] : nullptr;
@@ -350,25 +326,32 @@ version_free(struct h_world *world, const struct h_world_layout *layout, uint32_
 			node_free(world, layout, node);
 	}
 	slot->retired = nullptr;
-	slot_free(world, index);
+	--world->alive;
+	slot_free(world, index, fresh);
+}
+
+static void
+reclaim(struct h_world *world, bool fresh)
+{
+	const struct h_world_layout *layout = &world->layout;
+	uint32_t *link = &world->slots[poor_fan_published(&world->fan)].older;
+
+	for (; *link != 0; fresh = false) {
+		const uint32_t index = *link - 1;
+
+		if (poor_fan_unused(&world->fan, index)) {
+			*link = world->slots[index].older;
+			version_free(world, layout, index, fresh);
+		} else {
+			link = &world->slots[index].older;
+		}
+	}
 }
 
 EXPORT void
 h_world_reclaim(struct h_world *world)
 {
-	const struct h_world_layout *layout = &world->layout;
-	uint32_t *link = &world->slots[poor_fan_published(&world->fan)].older;
-
-	while (*link != 0) {
-		const uint32_t index = *link - 1;
-
-		if (poor_fan_unused(&world->fan, index)) {
-			*link = world->slots[index].older;
-			version_free(world, layout, index);
-		} else {
-			link = &world->slots[index].older;
-		}
-	}
+	reclaim(world, false);
 }
 
 EXPORT uint64_t
@@ -387,17 +370,12 @@ h_world_oldest_held(const struct h_world *world)
 EXPORT struct poor_world_stats
 h_world_stats(const struct h_world *world)
 {
-	struct poor_world_stats stats = {
+	return (struct poor_world_stats){
 		.bytes = world->memory.bytes,
 		.idle_bytes = world->memory.idle_bytes,
 		.nodes = world->nodes,
-		.versions = 1,
+		.versions = world->alive,
 	};
-
-	for (uint32_t older = world->slots[poor_fan_published(&world->fan)].older; older != 0;
-	     older = world->slots[older - 1].older)
-		++stats.versions;
-	return stats;
 }
 
 EXPORT void *
@@ -413,6 +391,8 @@ h_world_init(struct h_world *world, struct poor_fan_ref *refs, struct h_world_sl
 	world->free_last = 0;
 	world->next = POOR_FAN_NO_SLOT;
 	world->dead = POOR_WORLD_NO_HANDLE;
+	world->alive = 1;
+	world->stale = 0;
 	world->retired = nullptr;
 	world->born = nullptr;
 	world->nodes = 0;
@@ -420,12 +400,12 @@ h_world_init(struct h_world *world, struct poor_fan_ref *refs, struct h_world_sl
 	world->index.page_count = 0;
 	world->index.partial = H_WORLD_NO_PAGE;
 	world->index.vacant = H_WORLD_NO_PAGE;
-	world->index.order = 0;
+	world->index.capacity = 0;
 	h_world_memory_init(&world->memory, slab_bytes);
 	fill_array(array_ptr(slots, layout.slot_count),
 		   (struct h_world_slot){ .retired = nullptr, .id_high = 0, .older = 0 });
 	for (uint32_t index = 1; index < layout.slot_count; index++)
-		slot_free(world, index);
+		slot_free(world, index, false);
 	version = version_at(world, 0);
 	version->epoch = 0;
 	version->root = nullptr;
@@ -442,6 +422,7 @@ h_world_fini(struct h_world *world)
 	world->nodes = 0;
 	world->index.pages = nullptr;
 	world->index.page_count = 0;
+	world->index.capacity = 0;
 	world->index.partial = H_WORLD_NO_PAGE;
 	world->index.vacant = H_WORLD_NO_PAGE;
 }
@@ -467,10 +448,23 @@ h_world_begin(struct h_world *world)
 	world->slots[slot].id_high = world->slots[published].id_high;
 	world->slots[slot].older = 0;
 	world->next = slot;
+	world->version = next;
+	world->epoch = next->epoch;
 	world->retired = nullptr;
 	world->born = nullptr;
 	world->dead = POOR_WORLD_NO_HANDLE;
+	world->stale = 0;
 	return version_item(world, slot);
+}
+
+static void
+born_sweep(struct h_world *world, const struct h_world_layout *layout)
+{
+	for (struct poor_world_node *node = world->born, *link; node != nullptr; node = link) {
+		link = node_link(layout, node);
+		if (node_header(layout, node)->state != NODE_LIVE)
+			node_free(world, layout, node);
+	}
 }
 
 EXPORT void
@@ -480,11 +474,8 @@ h_world_publish(struct h_world *world)
 	const uint32_t published = poor_fan_published(&world->fan);
 	struct poor_world_version *next = version_next(world);
 
-	for (struct poor_world_node *node = world->born, *link; node != nullptr; node = link) {
-		link = node_link(layout, node);
-		if (node_header(layout, node)->state != NODE_LIVE)
-			node_free(world, layout, node);
-	}
+	if (world->stale != 0)
+		born_sweep(world, layout);
 	for (uint32_t handle = world->dead, link; handle != POOR_WORLD_NO_HANDLE; handle = link) {
 		link = entry_of(world, handle)->slot;
 		index_free(world, handle);
@@ -494,7 +485,8 @@ h_world_publish(struct h_world *world)
 	world->slots[published].retired = world->retired;
 	poor_fan_publish(&world->fan, world->next);
 	world->next = POOR_FAN_NO_SLOT;
-	h_world_reclaim(world);
+	++world->alive;
+	reclaim(world, true);
 	pages_fit(world);
 }
 
@@ -521,80 +513,36 @@ h_world_abort(struct h_world *world)
 			index_free(world, node->handle);
 		node_free(world, layout, node);
 	}
-	slot_free(world, world->next);
+	slot_free(world, world->next, true);
 	world->next = POOR_FAN_NO_SLOT;
 	pages_fit(world);
-}
-
-struct reserve {
-	struct poor_world_node *first;
-	struct poor_world_node **last;
-};
-
-static bool
-reserve_node(struct h_world *world, const struct h_world_layout *layout, struct reserve *reserve, size_t children)
-{
-	struct poor_world_node *node = node_alloc(world, layout, children);
-
-	if (node == nullptr)
-		return false;
-	node_header(layout, node)->link = nullptr;
-	*reserve->last = node;
-	reserve->last = &node_header(layout, node)->link;
-	return true;
-}
-
-static struct poor_world_node *
-reserve_take(struct h_world *world, const struct h_world_layout *layout, struct reserve *reserve)
-{
-	struct poor_world_node *node = reserve->first;
-
-	reserve->first = node_link(layout, node);
-	node_push(layout, &world->born, node);
-	return node;
-}
-
-static void
-reserve_drop(struct h_world *world, const struct h_world_layout *layout, struct reserve *reserve)
-{
-	for (struct poor_world_node *node = reserve->first, *link; node != nullptr; node = link) {
-		link = node_link(layout, node);
-		node_free(world, layout, node);
-	}
 }
 
 static bool
 node_owned(const struct h_world *world, const struct poor_world_node *node)
 {
-	return node->born == version_next(world)->epoch;
+	assert(world->next != POOR_FAN_NO_SLOT);
+	return node->born == world->epoch;
 }
 
-static bool
-path_reserve(struct h_world *world, const struct h_world_layout *layout, struct reserve *reserve, uint32_t handle,
-	     size_t capacity)
+static inline struct poor_world_node *
+node_copy(struct h_world *world, const struct h_world_layout *layout, struct poor_world_node *node, size_t capacity)
 {
-	for (; handle != POOR_WORLD_NO_HANDLE; handle = entry_of(world, handle)->parent, capacity = 0) {
-		struct poor_world_node *node = entry_of(world, handle)->node;
-		const bool owned = node_owned(world, node);
+	const size_t bytes = node_bytes(layout, node->child_count);
+	struct poor_world_node *copy;
+	struct node_header *header;
+	uint8_t order;
 
-		if (owned && node_capacity(layout, node) >= capacity)
-			break;
-		if (!reserve_node(world, layout, reserve, capacity > node->child_count ? capacity : node->child_count))
-			return false;
-		if (owned)
-			break;
-	}
-	return true;
-}
-
-static struct poor_world_node *
-node_copy(struct h_world *world, const struct h_world_layout *layout, struct reserve *reserve,
-	  struct poor_world_node *node)
-{
-	struct poor_world_node *copy = reserve_take(world, layout, reserve);
-
-	memcpy(node_item(layout, copy), node_item(layout, node), node_bytes(layout, node->child_count));
-	copy->born = version_next(world)->epoch;
+	copy = node_alloc(world, layout, capacity > node->child_count ? capacity : node->child_count);
+	if (copy == nullptr)
+		return nullptr;
+	header = node_header(layout, copy);
+	order = header->order;
+	memcpy(header, node_header(layout, node), (bytes + BLOCK_UNIT - 1) / BLOCK_UNIT * BLOCK_UNIT);
+	assert(header->state == NODE_LIVE);
+	header->order = order;
+	copy->born = world->epoch;
+	node_push(layout, &world->born, copy);
 	return copy;
 }
 
@@ -602,59 +550,27 @@ static void
 node_retire(struct h_world *world, const struct h_world_layout *layout, struct poor_world_node *node,
 	    enum node_state state)
 {
-	if (node_owned(world, node))
+	if (node_owned(world, node)) {
 		node_header(layout, node)->state = state;
-	else
+		++world->stale;
+	} else {
 		node_push(layout, &world->retired, node);
+	}
 }
 
-static struct poor_world_node *
-path_own(struct h_world *world, const struct h_world_layout *layout, struct reserve *reserve, uint32_t handle,
-	 size_t capacity)
+static void
+path_unwind(struct h_world *world, const struct h_world_layout *layout, const struct poor_world_node *until)
 {
-	struct h_world_entry *entry = entry_of(world, handle);
-	struct poor_world_node *node = entry->node;
-	struct poor_world_node *owned;
+	while (world->born != until) {
+		struct poor_world_node *copy = world->born;
+		struct poor_world_node *node = world->retired;
 
-	if (node_owned(world, node) && node_capacity(layout, node) >= capacity)
-		return node;
-	owned = node_copy(world, layout, reserve, node);
-	for (struct poor_world_node *copy = owned;;) {
-		struct h_world_entry *parent_entry =
-			entry->parent != POOR_WORLD_NO_HANDLE ? entry_of(world, entry->parent) : nullptr;
-		struct poor_world_node *parent = parent_entry != nullptr ? parent_entry->node : nullptr;
-		const uint32_t slot = parent != nullptr ? child_slot(layout, parent, entry) : 0;
-		struct poor_world_node *parent_copy;
-
-		node_retire(world, layout, node, NODE_REPLACED);
-		entry->node = copy;
-		if (parent == nullptr) {
-			version_next(world)->root = copy;
-			break;
-		}
-		if (node_owned(world, parent)) {
-			node_children(layout, parent)[slot] = copy;
-			break;
-		}
-		parent_copy = node_copy(world, layout, reserve, parent);
-		node_children(layout, parent_copy)[slot] = copy;
-		entry = parent_entry;
-		node = parent;
-		copy = parent_copy;
+		assert(copy->handle == node->handle);
+		world->born = node_link(layout, copy);
+		world->retired = node_link(layout, node);
+		entry_of(world, node->handle)->node = node;
+		node_free(world, layout, copy);
 	}
-	return owned;
-}
-
-static struct poor_world_node *
-path_touch(struct h_world *world, const struct h_world_layout *layout, uint32_t handle, size_t capacity)
-{
-	struct reserve reserve = { .first = nullptr, .last = &reserve.first };
-
-	if (!path_reserve(world, layout, &reserve, handle, capacity)) {
-		reserve_drop(world, layout, &reserve);
-		return nullptr;
-	}
-	return path_own(world, layout, &reserve, handle, capacity);
 }
 
 static void
@@ -673,16 +589,53 @@ path_disown(struct h_world *world, const struct h_world_layout *layout, const st
 
 		node_children(layout, parent)[child_slot(layout, parent, entry)] = top;
 	}
-	while (world->born != until) {
-		struct poor_world_node *copy = world->born;
-		struct poor_world_node *node = world->retired;
+	path_unwind(world, layout, until);
+}
 
-		assert(copy->handle == node->handle);
-		world->born = node_link(layout, copy);
-		world->retired = node_link(layout, node);
-		entry_of(world, node->handle)->node = node;
-		node_free(world, layout, copy);
+/* When a copy fails, every copy before it replaced a node of an older version,
+ * so path_unwind() finds them in pairs. */
+static struct poor_world_node *
+path_touch(struct h_world *world, const struct h_world_layout *layout, uint32_t handle, size_t capacity)
+{
+	struct h_world_entry *entry = entry_of(world, handle);
+	struct poor_world_node *node = entry->node;
+	const struct poor_world_node *born = world->born;
+	struct poor_world_node *owned;
+	struct poor_world_node *copy;
+
+	if (node_owned(world, node) && (capacity == 0 || node_capacity(layout, node) >= capacity))
+		return node;
+	owned = copy = node_copy(world, layout, node, capacity);
+	if (copy == nullptr)
+		return nullptr;
+	for (;;) {
+		struct h_world_entry *above =
+			entry->parent != POOR_WORLD_NO_HANDLE ? entry_of(world, entry->parent) : nullptr;
+		struct poor_world_node *parent = above != nullptr ? above->node : nullptr;
+		const uint32_t slot = parent != nullptr ? child_slot(layout, parent, entry) : 0;
+		struct poor_world_node *parent_copy;
+
+		node_retire(world, layout, node, NODE_REPLACED);
+		entry->node = copy;
+		if (parent == nullptr) {
+			version_next(world)->root = copy;
+			break;
+		}
+		if (node_owned(world, parent)) {
+			node_children(layout, parent)[slot] = copy;
+			break;
+		}
+		parent_copy = node_copy(world, layout, parent, 0);
+		if (parent_copy == nullptr) {
+			path_unwind(world, layout, born);
+			return nullptr;
+		}
+		node_children(layout, parent_copy)[slot] = copy;
+		entry = above;
+		node = parent;
+		copy = parent_copy;
 	}
+	return owned;
 }
 
 static void
@@ -707,7 +660,6 @@ h_world_create(struct h_world *world, uint32_t parent, uint32_t index)
 {
 	const struct h_world_layout *layout = &world->layout;
 	struct poor_world_version *next = version_next(world);
-	struct reserve reserve = { .first = nullptr, .last = &reserve.first };
 	const size_t capacity =
 		parent != POOR_WORLD_NO_HANDLE ? (size_t)entry_alive(world, parent)->node->child_count + 1 : 0;
 	struct poor_world_node *above = nullptr;
@@ -715,15 +667,19 @@ h_world_create(struct h_world *world, uint32_t parent, uint32_t index)
 	struct h_world_entry *entry;
 
 	assert(parent != POOR_WORLD_NO_HANDLE ? index < capacity : next->root == nullptr && index == 0);
-	if (!index_reserve(world) || !path_reserve(world, layout, &reserve, parent, capacity)
-	    || !reserve_node(world, layout, &reserve, 0)) {
-		reserve_drop(world, layout, &reserve);
+	node = index_reserve(world) ? node_alloc(world, layout, 0) : nullptr;
+	if (node != nullptr && parent != POOR_WORLD_NO_HANDLE) {
+		above = path_touch(world, layout, parent, capacity);
+		if (above == nullptr) {
+			node_free(world, layout, node);
+			node = nullptr;
+		}
+	}
+	if (node == nullptr) {
 		index_unreserve(world);
 		return nullptr;
 	}
-	if (parent != POOR_WORLD_NO_HANDLE)
-		above = path_own(world, layout, &reserve, parent, capacity);
-	node = reserve_take(world, layout, &reserve);
+	node_push(layout, &world->born, node);
 	node->born = next->epoch;
 	node->id = ++world->slots[world->next].id_high;
 	node->handle = index_alloc(world);
@@ -795,11 +751,9 @@ h_world_destroy(struct h_world *world, uint32_t handle)
 }
 
 EXPORT struct poor_world_node *
-h_world_edit(struct h_world *world, uint32_t handle)
+h_world_copy(struct h_world *world, uint32_t handle)
 {
-	const struct h_world_layout *layout = &world->layout;
-	entry_alive(world, handle);
-	return path_touch(world, layout, handle, 0);
+	return path_touch(world, &world->layout, handle, 0);
 }
 
 [[maybe_unused]] static bool

@@ -312,6 +312,7 @@ void poor_world_diff_stop(struct poor_world_diff *diff);
 /* Implementation details, subject to change. */
 
 constexpr uint32_t H_WORLD_NO_PAGE = UINT32_MAX;
+constexpr uint32_t H_WORLD_PAGE_ENTRIES = 128;
 constexpr uint32_t H_WORLD_ORDERS = 120;
 constexpr size_t H_WORLD_ALIGN = 64;
 constexpr size_t H_WORLD_HEADER = 16;
@@ -372,12 +373,13 @@ struct h_world_layout {
 	uint32_t slot_count;
 	uint32_t version_bytes;
 	uint32_t version_hook;
-	uint32_t node_base;
-	uint32_t node_hook;
-	uint32_t children;
+	uint32_t node_header;
+	uint32_t node_children;
+	uint32_t block_bytes;
 };
 
 poor_list_declare(h_world_spans);
+poor_list_declare(h_world_fed);
 
 struct h_world_memory {
 	size_t slab_bytes;
@@ -385,9 +387,9 @@ struct h_world_memory {
 	size_t bytes;
 	size_t idle_bytes;
 	h_world_spans partial[H_WORLD_ORDERS];
-	h_world_spans full;
 	h_world_spans empty;
 	h_world_spans empty_big;
+	h_world_fed fed;
 };
 
 struct h_world_entry {
@@ -407,9 +409,9 @@ struct h_world_page {
 struct h_world_index {
 	struct h_world_page *pages;
 	uint32_t page_count;
+	uint32_t capacity;
 	uint32_t partial;
 	uint32_t vacant;
-	uint8_t order;
 };
 
 poor_fan_declare(h_world_fan);
@@ -424,6 +426,10 @@ struct h_world {
 	uint32_t free_last;
 	uint32_t next;
 	uint32_t dead;
+	uint32_t alive;
+	uint32_t stale;
+	struct poor_world_version *version;
+	uint64_t epoch;
 	struct poor_world_node *retired;
 	struct poor_world_node *born;
 	uint64_t nodes;
@@ -440,6 +446,7 @@ static_assert(offsetof(struct h_world, refs) == H_WORLD_ALIGN
 #define h_world_declare(name, meta, node_type, node_member, version_type, version_member, version_count)		\
 	static_assert((version_count) >= 2 && (version_count) <= POOR_FAN_MAX_SLOTS);					\
 	static_assert(alignof(node_type) <= H_WORLD_ALIGN && alignof(node_type) >= alignof(void *));			\
+	static_assert(alignof(version_type) <= H_WORLD_ALIGN);								\
 	static_assert(_Generic(&((node_type *)nullptr)->node_member, struct poor_world_node *: 1, default: 0),		\
 		      "node member (" #node_member ") must be an unqualified struct poor_world_node");			\
 	static_assert(_Generic(&((version_type *)nullptr)->version_member, struct poor_world_version *: 1, default: 0),	\
@@ -457,7 +464,9 @@ static_assert(offsetof(struct h_world, refs) == H_WORLD_ALIGN
 		};													\
 		struct poor_fan_ref refs[version_count];									\
 		struct h_world_slot slots[version_count];								\
-		version_type versions[version_count];									\
+		struct {												\
+			alignas(H_WORLD_ALIGN) version_type version;							\
+		} versions[version_count];										\
 	} name
 
 #define h_world_of(w) (&(w)->world)
@@ -469,16 +478,19 @@ static_assert(offsetof(struct h_world, refs) == H_WORLD_ALIGN
 	((sizeof(h_world_node_type(w)) + alignof(void *) - 1) / alignof(void *) * alignof(void *))
 #define h_world_children_at(w) (h_world_node_bytes(w) - h_world_node_hook(w))
 #define h_world_slot_count(w) (sizeof((w)->refs) / sizeof((w)->refs[0]))
-#define h_world_version_bytes(w) sizeof(h_world_version_type(w))
+#define h_world_version_bytes(w) sizeof((w)->versions[0])
+
+#define h_world_node_base(w)												\
+	((H_WORLD_HEADER + alignof(h_world_node_type(w)) - 1) / alignof(h_world_node_type(w))				\
+	 * alignof(h_world_node_type(w)))
 
 #define h_world_layout_of(w) ((struct h_world_layout){									\
 	.slot_count = h_world_slot_count(w),										\
 	.version_bytes = h_world_version_bytes(w),									\
 	.version_hook = h_world_version_hook(w),									\
-	.node_base = (H_WORLD_HEADER + alignof(h_world_node_type(w)) - 1) / alignof(h_world_node_type(w))		\
-		     * alignof(h_world_node_type(w)),									\
-	.node_hook = h_world_node_hook(w),										\
-	.children = h_world_node_bytes(w),										\
+	.node_header = h_world_node_base(w) + h_world_node_hook(w),							\
+	.node_children = h_world_children_at(w),									\
+	.block_bytes = h_world_node_base(w) + h_world_node_bytes(w),							\
 })
 
 #define h_world_node_of(w, node)										\
@@ -502,10 +514,8 @@ void h_world_abort(struct h_world *world);
 void h_world_reclaim(struct h_world *world);
 [[nodiscard]] struct poor_world_node *h_world_create(struct h_world *world, uint32_t parent, uint32_t index);
 [[nodiscard]] bool h_world_destroy(struct h_world *world, uint32_t handle);
-[[nodiscard]] struct poor_world_node *h_world_edit(struct h_world *world, uint32_t handle);
+[[nodiscard]] struct poor_world_node *h_world_copy(struct h_world *world, uint32_t handle);
 [[nodiscard]] bool h_world_move(struct h_world *world, uint32_t handle, uint32_t parent, uint32_t index);
-struct poor_world_node *h_world_find(const struct h_world *world, uint32_t handle);
-uint32_t h_world_parent(const struct h_world *world, uint32_t handle);
 uint32_t h_world_index_of(struct h_world *world, uint32_t handle);
 uint64_t h_world_oldest_held(const struct h_world *world);
 void h_world_diff_begin(struct poor_world_diff *diff, struct poor_world_diff_scratch *scratch,
@@ -546,6 +556,39 @@ h_world_child(const struct poor_world_node *node, size_t children_at, uint32_t i
 {
 	assert(index < node->child_count);
 	return h_world_children(node, children_at)[index];
+}
+
+static inline struct poor_world_node *
+h_world_find(const struct h_world *world, uint32_t handle)
+{
+	const struct h_world_index *index = &world->index;
+	const uint32_t page = handle / H_WORLD_PAGE_ENTRIES;
+
+	if (page >= index->page_count || index->pages[page].entries == nullptr)
+		return nullptr;
+	return index->pages[page].entries[handle % H_WORLD_PAGE_ENTRIES].node;
+}
+
+static inline struct h_world_entry *
+h_world_entry(const struct h_world *world, uint32_t handle)
+{
+	assert(h_world_find(world, handle) != nullptr);
+	return &world->index.pages[handle / H_WORLD_PAGE_ENTRIES].entries[handle % H_WORLD_PAGE_ENTRIES];
+}
+
+static inline uint32_t
+h_world_parent(const struct h_world *world, uint32_t handle)
+{
+	return h_world_entry(world, handle)->parent;
+}
+
+[[nodiscard]] static inline struct poor_world_node *
+h_world_edit(struct h_world *world, uint32_t handle)
+{
+	struct poor_world_node *node = h_world_entry(world, handle)->node;
+
+	assert(world->next != POOR_FAN_NO_SLOT);
+	return node->born == world->epoch ? node : h_world_copy(world, handle);
 }
 
 static inline size_t

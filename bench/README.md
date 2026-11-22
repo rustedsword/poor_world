@@ -61,14 +61,14 @@ On a Ryzen AI 9 HX 370 held at 2.0 GHz, with GCC 16.2. Its CPUs 0 to 3 are the f
 others are compact cores with another, so the fourth reader is the first one in another cache.
 
     reading the clock twice takes 41 ns, subtracted from publish and diff
-    2000 windows, 60 per parent, commit: publish  224 ns (214..243), diff  199 ns (198..202), 1.00 changes
-    2000 windows, 60 per parent, move  : publish  185 ns (182..187), diff  181 ns (181..183), 1.00 changes
-    2000 windows, 60 per parent, raise : publish  202 ns (200..204), diff  284 ns (282..286), 0.98 changes
-    2000 windows, 60 per parent, lookup:    5 ns (5..7), memory 2944 KiB
-    2000 windows, 2000 per parent, commit: publish  333 ns (329..367), diff 1816 ns (1812..1831), 1.00 changes
-    2000 windows, 2000 per parent, move  : publish  291 ns (289..297), diff 1801 ns (1798..1860), 1.00 changes
-    2000 windows, 2000 per parent, raise : publish  913 ns (858..971), diff 5487 ns (5456..5529), 1.00 changes
-    2000 windows, 2000 per parent, lookup:    5 ns (5..9), memory 2816 KiB
+    2000 windows, 60 per parent, commit: publish  169 ns (166..194), diff  169 ns (167..174), 1.00 changes
+    2000 windows, 60 per parent, move  : publish  132 ns (131..139), diff  160 ns (159..186), 1.00 changes
+    2000 windows, 60 per parent, raise : publish  153 ns (152..158), diff  258 ns (254..260), 0.98 changes
+    2000 windows, 60 per parent, lookup:    5 ns (5..5), memory 2944 KiB
+    2000 windows, 2000 per parent, commit: publish  291 ns (287..305), diff 1169 ns (1154..1206), 1.00 changes
+    2000 windows, 2000 per parent, move  : publish  252 ns (249..257), diff 1152 ns (1136..1166), 1.00 changes
+    2000 windows, 2000 per parent, raise : publish  881 ns (827..895), diff 5102 ns (5079..5146), 1.00 changes
+    2000 windows, 2000 per parent, lookup:    5 ns (5..8), memory 2816 KiB
 
     40-byte nodes in slabs of 64 KiB: 200 groups of 50 under one root
     only the root                                  128 KiB
@@ -81,27 +81,26 @@ others are compact cores with another, so the fourth reader is the first one in 
     the writer on CPU 0, readers on CPUs 3 2 1 4 5 6 7 8; 100 ms a run, median of 5 runs (lowest..highest)
              the writer does nothing                             the writer publishes as fast as it can
     readers  latest()                  latest() and release()    latest()                  publish()                 versions a reader saw
-          0                                                                                67.0 ns (67.0..67.0)
-          1  2.0 ns (2.0..2.0)         19.3 ns (19.2..19.3)      5.2 ns (4.8..5.3)         186.0 ns (171.0..192.0)   83.0 % (71.0..87.0)
-          2  2.0 ns (2.0..2.0)         100.4 ns (99.0..104.8)    12.3 ns (11.0..12.4)      259.0 ns (259.0..265.0)   79.0 % (78.0..80.0)
-          3  2.0 ns (2.0..2.0)         121.8 ns (116.4..127.5)   17.3 ns (16.2..17.5)      318.0 ns (316.0..324.0)   74.0 % (73.0..76.0)
-          4  2.1 ns (2.1..2.2)         390.2 ns (372.5..396.5)   31.9 ns (30.1..32.2)      574.0 ns (571.0..579.0)   68.0 % (67.0..68.0)
-          8  2.5 ns (2.0..2.5)         509.3 ns (452.4..513.1)   30.1 ns (24.5..31.4)      875.0 ns (732.0..885.0)   58.0 % (58.0..58.0)
+          0                                                                                48.0 ns (48.0..48.0)
+          1  1.6 ns (1.6..1.6)         19.3 ns (19.3..19.3)      4.1 ns (4.1..4.3)         148.0 ns (146.0..151.0)   65.0 % (51.0..71.0)
+          2  1.6 ns (1.5..1.6)         93.2 ns (86.0..100.8)     10.0 ns (9.3..10.4)       212.0 ns (198.0..216.0)   67.0 % (62.0..70.0)
+          3  1.6 ns (1.6..1.6)         116.7 ns (116.7..128.3)   12.9 ns (11.8..15.5)      262.0 ns (246.0..274.0)   65.0 % (59.0..67.0)
+          4  1.7 ns (1.7..1.7)         390.7 ns (375.1..396.5)   17.1 ns (15.6..19.4)      508.0 ns (484.0..517.0)   68.0 % (61.0..69.0)
+          8  1.9 ns (1.6..1.9)         514.6 ns (449.5..519.5)   18.2 ns (15.5..19.0)      796.0 ns (665.0..818.0)   53.0 % (53.0..55.0)
 
 What they show:
 
-- A publish that changes one node is 0.2 to 0.35 µs, and finding the change about the same in groups of 60. Under one
-  parent with 2000 children every publish copies 2000 pointers and every diff walks them: 1.8 µs to find a change, and
-  a raise is 0.9 µs to publish and 5.5 µs to find.
+- A publish that changes one node is 0.13 to 0.3 µs, and finding the change 0.16 to 0.27 µs in groups of 60. Under
+  one parent with 2000 children every publish copies 2000 pointers and every diff walks them: 1.2 µs to find a change,
+  and a raise is 0.9 µs to publish and 5 µs to find.
 - A node of 40 bytes takes 96 bytes, with its block, its handle and its place in the parent. Destroying the tree gives
   back all of it after the next change to the root. One leaf in 100 left keeps everything until what is left is
   edited; then the nodes pack, and of the 384 KiB that stay, 160 KiB are the pages of their handles.
-- `poor_world_latest()` with nothing new is a load and a compare: about 2 ns with any number of readers.
-- Taking a version is not free when readers do it together: 19 ns alone, about 100 ns with two readers and 450 to
-  510 ns with eight.
-- Readers that take every version slow the writer down: a publish is about 70 ns with no reader, about 190 ns with
-  one and 730 to 890 ns with eight.
+- `poor_world_latest()` with nothing new is a load and a compare: between 1 and 2 ns with any number of readers.
+- Taking a version is not free when readers do it together: 19 ns alone, about 95 ns with two readers and 450 to
+  520 ns with eight.
+- Readers that take every version slow the writer down: a publish is about 50 ns with no reader, about 150 ns with
+  one and 670 to 820 ns with eight.
 
 The reader figures also move with where the compiler puts the reader's loop. Built by hand with that loop shifted a few
-bytes at a time, the same instructions took 1.1 to 2.0 ns for `poor_world_latest()` with nothing new. With eight
-readers and a writer that publishes, `poor_world_latest()` took 18 to 29 ns and a publish 760 to 870 ns.
+bytes at a time, the same instructions took 1.1 to 2.0 ns for `poor_world_latest()` with nothing new.

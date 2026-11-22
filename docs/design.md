@@ -21,9 +21,10 @@ array next to the versions, not in them. So nothing a reader can reach is writte
 
 ## Readers
 
-All versions live in the `slots` of the tree. Which of them readers get is kept by a fan, `poor_fan.h` from
-poor_base. One 64-bit word holds the slot of the published version in its low 16 bits and, above them, the number of
-holds taken since it was published. Each slot has a count of holds (low 32 bits) and pins (high 32 bits).
+All versions live in the `slots` of the tree, each padded to whole cache lines: the writer filling one never shares a
+line with one a reader has. Which of them readers get is kept by a fan, `poor_fan.h` from poor_base. One 64-bit word
+holds the slot of the published version in its low 16 bits and, above them, the number of holds taken since it was
+published. Each slot has a count of holds (low 32 bits) and pins (high 32 bits).
 
 - `poor_world_latest()` adds one to the word and reads the slot from the result, in one atomic operation. No publish
   can slip between reading the slot and being counted. If the hold already has the published slot it does nothing.
@@ -52,9 +53,10 @@ reader that holds an old version keeps only the nodes of that version.
 
 The writer learns that a version was let go by reading its count: one count for every older version that is still
 alive, at each publish and in `poor_world_reclaim()`. The slot of a freed version goes on the writer's own list of
-free slots, and a transaction takes the one that has been free the longest. So `poor_world_begin()` reads nothing
-that readers write unless no slot is free, and what a publish costs grows with the versions still in use, not with the
-number of slots.
+free slots, and a transaction takes the one that has been free the longest. One slot goes ahead of the others: that of
+a version nobody held when the next one was published. Most likely no reader took it at all, and the writer still has
+it in its cache. So `poor_world_begin()` reads nothing that readers write unless no slot is free, and what a publish
+costs grows with the versions still in use, not with the number of slots.
 
 Nodes made by a transaction and replaced or destroyed again inside it are freed at publish. An abort frees every node
 the transaction made.
@@ -87,14 +89,14 @@ The library takes memory only from `poor_world_feed()`.
   any size.
 - New blocks come from the slab that most recently stopped being full, so slabs that are emptying are left to empty.
 
-Before an operation changes anything it takes every block it will need: the copies of the path, a larger block for a
-parent that is full, a page of the handle table. If one is missing the blocks go back and the operation fails with the
-tree as it was. This is why `poor_world_edit()` of an ancestor cannot fail after `poor_world_edit()` of a node: the
-ancestors were copied by the same operation.
+An operation copies the path one node at a time, from the node up, and takes the block for each copy when it gets
+there. If a block is missing, the copies made so far are taken back and the operation fails with the tree as it was.
+`poor_world_create()` takes the page of the handle table and the block of the new node first, and gives them back the
+same way. This is why `poor_world_edit()` of an ancestor cannot fail after `poor_world_edit()` of a node: the ancestors
+were copied by the same operation.
 
-`poor_world_move()` to another parent is the one exception. It needs the paths of both parents, and they share their
-upper nodes, so it copies the path of the old parent first and then the path of the new one. If the second cannot be
-copied, the first copies are taken back and the move fails with the tree as it was, like every other operation.
+`poor_world_move()` to another parent copies two paths, the one of the old parent first. If the second cannot be
+copied, the first is taken back as well.
 
 `poor_world_wanted()` is the size of the slab or span that was missing. One operation can need several, of different
 block sizes, so feed and retry in a loop.
@@ -126,7 +128,7 @@ and one scratch serves the whole walk.
 | `poor_world_node()`, `poor_world_parent()` | two loads |
 | `poor_world_edit()` | copies `d` nodes the first time in a transaction, nothing after that |
 | `poor_world_create()`, `poor_world_destroy()`, `poor_world_move()` | `poor_world_edit()` of the parent, plus moving up to `c` pointers |
-| `poor_world_publish()` | the nodes the transaction made, replaced or destroyed, and one load per older version still in use |
+| `poor_world_publish()` | the nodes the transaction replaced or destroyed, also the ones it made if one of those is among them, and one load per older version still in use |
 | `poor_world_abort()` | the nodes the transaction made, replaced or destroyed |
 | `poor_world_diff_next()` over a node | the children that are not the same pointer; all `c` when the order changed |
 

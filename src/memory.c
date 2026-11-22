@@ -1,36 +1,10 @@
 /* SPDX-License-Identifier: MIT */
 #include "internal.h"
 
-struct span {
-	struct poor_list_node link;
-	void *free;
-	size_t bytes;
-	uint32_t live;
-	uint32_t carved;
-	uint32_t capacity;
-	uint32_t order;
-};
-
-poor_list_define(h_world_spans, struct span, link);
-
-static_assert(sizeof(struct span) <= SPAN_HEADER);
-
 #ifdef H_WORLD_FAULTS
 uint64_t h_world_fault_countdown;
 uint64_t h_world_faults;
 #endif
-
-static void *
-span_block(struct span *span, size_t offset)
-{
-	return (unsigned char *)span + SPAN_HEADER + offset;
-}
-
-static struct span *
-block_span(const struct h_world_memory *memory, void *block)
-{
-	return (void *)((unsigned char *)block - ((uintptr_t)block & (memory->slab_bytes - 1)));
-}
 
 static h_world_spans *
 spans_idle(struct h_world_memory *memory, const struct span *span)
@@ -46,104 +20,44 @@ span_idle(struct h_world_memory *memory, struct span *span)
 	memory->idle_bytes += span->bytes;
 }
 
-static void
-span_use(struct h_world_memory *memory, struct span *span, uint32_t order)
+static struct span *
+span_find(struct h_world_memory *memory, size_t bytes)
 {
+	if (bytes <= memory->slab_bytes - SPAN_HEADER)
+		return poor_list_first(&memory->empty);
+	poor_list_foreach(&memory->empty_big, span) {
+		if (span->bytes - SPAN_HEADER >= bytes)
+			return span;
+	}
+	return nullptr;
+}
+
+struct span *
+h_world_span_open(struct h_world_memory *memory, uint32_t order)
+{
+	const size_t bytes = block_bytes(order);
+	const size_t slab = memory->slab_bytes;
+	struct span *span = span_find(memory, bytes);
+
+	if (span == nullptr) {
+		memory->wanted = (bytes + SPAN_HEADER + slab - 1) / slab * slab;
+		return nullptr;
+	}
 	poor_list_remove(spans_idle(memory, span), span);
 	memory->idle_bytes -= span->bytes;
 	span->order = order;
 	span->free = nullptr;
 	span->carved = 0;
-	span->capacity = (uint32_t)((span->bytes - SPAN_HEADER) / (block_bytes(order)));
-}
-
-static bool
-block_is_big(const struct h_world_memory *memory, uint32_t order)
-{
-	return block_bytes(order) > memory->slab_bytes - SPAN_HEADER;
-}
-
-static void *
-big_alloc(struct h_world_memory *memory, uint32_t order)
-{
-	const size_t bytes = block_bytes(order);
-
-	poor_list_foreach(&memory->empty_big, span) {
-		if (span->bytes - SPAN_HEADER < bytes)
-			continue;
-		span_use(memory, span, order);
-		span->live = 1;
-		poor_list_append(&memory->full, span);
-		poor_asan_unpoison_region(span_block(span, 0), bytes);
-		return span_block(span, 0);
-	}
-	memory->wanted = (bytes + SPAN_HEADER + memory->slab_bytes - 1) / memory->slab_bytes * memory->slab_bytes;
-	return nullptr;
-}
-
-void *
-h_world_block_alloc(struct h_world_memory *memory, uint32_t order)
-{
-	const size_t bytes = block_bytes(order);
-	struct span *span = poor_list_first(&memory->partial[order]);
-	void *block;
-
-#ifdef H_WORLD_FAULTS
-	if (h_world_fault_countdown != 0 && --h_world_fault_countdown == 0) {
-		++h_world_faults;
-		memory->wanted = 0;
-		return nullptr;
-	}
-#endif
-	if (block_is_big(memory, order))
-		return big_alloc(memory, order);
-	if (span == nullptr) {
-		span = poor_list_first(&memory->empty);
-		if (span == nullptr) {
-			memory->wanted = memory->slab_bytes;
-			return nullptr;
-		}
-		span_use(memory, span, order);
-		poor_list_append(&memory->partial[order], span);
-	}
-	if (span->free != nullptr) {
-		block = span->free;
-		poor_asan_unpoison_region(block, bytes);
-		span->free = *(void **)block;
-	} else {
-		block = span_block(span, span->carved++ * bytes);
-		poor_asan_unpoison_region(block, bytes);
-	}
-	if (++span->live == span->capacity) {
-		poor_list_remove(&memory->partial[order], span);
-		poor_list_append(&memory->full, span);
-	}
-	return block;
+	span->capacity = bytes <= slab - SPAN_HEADER ? (uint32_t)((span->bytes - SPAN_HEADER) / bytes) : 1;
+	poor_list_append(&memory->partial[order], span);
+	return span;
 }
 
 void
-h_world_block_free(struct h_world_memory *memory, void *block, uint32_t order)
+h_world_span_close(struct h_world_memory *memory, struct span *span)
 {
-	const size_t bytes = block_bytes(order);
-	struct span *span = block_span(memory, block);
-
-	if (block_is_big(memory, order)) {
-		poor_asan_poison_region(block, bytes);
-		poor_list_remove(&memory->full, span);
-		span_idle(memory, span);
-		return;
-	}
-	*(void **)block = span->free;
-	span->free = block;
-	poor_asan_poison_region(block, bytes);
-	if (span->live == span->capacity) {
-		poor_list_remove(&memory->full, span);
-		poor_list_prepend(&memory->partial[order], span);
-	}
-	if (--span->live == 0) {
-		poor_list_remove(&memory->partial[order], span);
-		span_idle(memory, span);
-	}
+	poor_list_remove(&memory->partial[span->order], span);
+	span_idle(memory, span);
 }
 
 void
@@ -157,27 +71,23 @@ h_world_memory_init(struct h_world_memory *memory, size_t slab_bytes)
 	memory->idle_bytes = 0;
 	foreach_array_ref(memory->partial, spans)
 		poor_list_init(spans);
-	poor_list_init(&memory->full);
 	poor_list_init(&memory->empty);
 	poor_list_init(&memory->empty_big);
-}
-
-static void
-spans_release(struct h_world_memory *memory, h_world_spans *spans)
-{
-	poor_list_foreach_safe(spans, span) {
-		poor_list_remove(spans, span);
-		poor_asan_poison_region(span_block(span, 0), span->bytes - SPAN_HEADER);
-		span_idle(memory, span);
-	}
+	poor_list_init(&memory->fed);
 }
 
 void
 h_world_memory_fini(struct h_world_memory *memory)
 {
 	foreach_array_ref(memory->partial, spans)
-		spans_release(memory, spans);
-	spans_release(memory, &memory->full);
+		poor_list_init(spans);
+	poor_list_init(&memory->empty);
+	poor_list_init(&memory->empty_big);
+	memory->idle_bytes = 0;
+	poor_list_foreach(&memory->fed, span) {
+		poor_asan_poison_region((unsigned char *)span + SPAN_HEADER, span->bytes - SPAN_HEADER);
+		span_idle(memory, span);
+	}
 }
 
 EXPORT void
@@ -189,8 +99,9 @@ h_world_feed(struct h_world *world, void *memory, size_t bytes)
 	assert(bytes >= m->slab_bytes && bytes % m->slab_bytes == 0);
 	assert((uintptr_t)memory % m->slab_bytes == 0);
 	span->bytes = bytes;
-	poor_asan_poison_region(span_block(span, 0), bytes - SPAN_HEADER);
+	poor_asan_poison_region((unsigned char *)span + SPAN_HEADER, bytes - SPAN_HEADER);
 	m->bytes += bytes;
+	poor_list_append(&m->fed, span);
 	span_idle(m, span);
 }
 
@@ -205,6 +116,7 @@ h_world_take(struct h_world *world, size_t *bytes)
 	if (span == nullptr)
 		return nullptr;
 	poor_list_remove(spans_idle(m, span), span);
+	poor_list_remove(&m->fed, span);
 	m->bytes -= span->bytes;
 	m->idle_bytes -= span->bytes;
 	*bytes = span->bytes;

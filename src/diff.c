@@ -92,7 +92,7 @@ match_rotation(uint32_t count, struct poor_world_node *const *old, struct poor_w
 	return true;
 }
 
-static void
+[[gnu::noinline]] static void
 match_middle(struct poor_world_diff *diff)
 {
 	struct poor_world_diff_scratch *scratch = diff->scratch;
@@ -150,50 +150,60 @@ yield(struct poor_world_diff *diff, const struct poor_world_node *old, const str
 	return true;
 }
 
+static uint32_t
+unchanged_head(struct poor_world_node *const *old, struct poor_world_node *const *new, uint32_t count)
+{
+	uint32_t run = 0;
+
+	while (run < count && old[run] == new[run])
+		++run;
+	return run;
+}
+
+static uint32_t
+unchanged_tail(struct poor_world_node *const *old, struct poor_world_node *const *new, uint32_t count)
+{
+	uint32_t run = 0;
+
+	while (run < count && old[-(ptrdiff_t)run] == new[-(ptrdiff_t)run])
+		++run;
+	return run;
+}
+
 static bool
 scan_head(struct poor_world_diff *diff, uint32_t shared)
 {
-	struct poor_world_node *const *olds = diff->old, *const *news = diff->new;
-	const bool all = diff->all;
+	struct poor_world_node *const *old = &diff->old[diff->head], *const *new = &diff->new[diff->head];
 	uint32_t head = diff->head;
 
-	while (head < shared) {
-		const struct poor_world_node *old = olds[head], *next = news[head];
-
-		if (!same(old, next))
-			break;
-		++head;
-		if (all || old != next) {
-			diff->head = head;
-			return yield(diff, old, next, false);
-		}
-	}
+	if (!diff->all)
+		head += unchanged_head(old, new, shared - head);
 	diff->head = head;
-	return false;
+	if (head == shared || !same(diff->old[head], diff->new[head]))
+		return false;
+	diff->head = head + 1;
+	return yield(diff, diff->old[head], diff->new[head], false);
 }
 
 static bool
 scan_tail(struct poor_world_diff *diff, uint32_t shared)
 {
-	struct poor_world_node *const *olds = diff->old, *const *news = diff->new;
-	const uint32_t old_last = diff->old_count - 1, new_last = diff->new_count - 1;
-	const uint32_t head = diff->head;
-	const bool all = diff->all;
+	const uint32_t rest = shared - diff->head;
 	uint32_t tail = diff->tail;
+	const struct poor_world_node *old, *next;
 
-	while (head + tail < shared) {
-		const struct poor_world_node *old = olds[old_last - tail], *next = news[new_last - tail];
-
-		if (!same(old, next))
-			break;
-		++tail;
-		if (all || old != next) {
-			diff->tail = tail;
-			return yield(diff, old, next, false);
-		}
-	}
+	if (!diff->all && tail < rest)
+		tail += unchanged_tail(&diff->old[diff->old_count - 1 - tail], &diff->new[diff->new_count - 1 - tail],
+				       rest - tail);
 	diff->tail = tail;
-	return false;
+	if (tail == rest)
+		return false;
+	old = diff->old[diff->old_count - 1 - tail];
+	next = diff->new[diff->new_count - 1 - tail];
+	if (!same(old, next))
+		return false;
+	diff->tail = tail + 1;
+	return yield(diff, old, next, false);
 }
 
 static bool
@@ -215,29 +225,20 @@ scan_common(struct poor_world_diff *diff, const struct poor_world_diff_match *ma
 	return false;
 }
 
-EXPORT bool
-poor_world_diff_next(struct poor_world_diff *diff)
+EXPORT void
+poor_world_diff_stop(struct poor_world_diff *diff)
 {
-	const uint32_t shared = diff->old_count < diff->new_count ? diff->old_count : diff->new_count;
+	diff->scratch->top = diff->base;
+	diff->phase = PHASE_DONE;
+}
+
+[[gnu::noinline]] static bool
+next_matched(struct poor_world_diff *diff)
+{
 	const uint32_t new_count = diff->new_count - diff->head - diff->tail;
 	const struct poor_world_diff_match *matches = &diff->scratch->matches[diff->base];
 
 	switch ((enum phase)diff->phase) {
-	case PHASE_HEAD:
-		if (scan_head(diff, shared))
-			return true;
-		diff->phase = PHASE_TAIL;
-		[[fallthrough]];
-	case PHASE_TAIL:
-		if (scan_tail(diff, shared))
-			return true;
-		if (diff->head + diff->tail == diff->old_count && diff->head + diff->tail == diff->new_count) {
-			diff->phase = PHASE_DONE;
-			return false;
-		}
-		match_middle(diff);
-		diff->phase = PHASE_ADDED;
-		return poor_world_diff_next(diff);
 	case PHASE_ADDED:
 		if (diff->at > diff->common)
 			return yield(diff, nullptr, diff->new[diff->head + matches[--diff->at].new_index], false);
@@ -255,15 +256,30 @@ poor_world_diff_next(struct poor_world_diff *diff)
 			return true;
 		poor_world_diff_stop(diff);
 		return false;
-	case PHASE_DONE:
-		break;
+	default:
+		return false;
 	}
-	return false;
 }
 
-EXPORT void
-poor_world_diff_stop(struct poor_world_diff *diff)
+EXPORT bool
+poor_world_diff_next(struct poor_world_diff *diff)
 {
-	diff->scratch->top = diff->base;
-	diff->phase = PHASE_DONE;
+	const uint32_t shared = diff->old_count < diff->new_count ? diff->old_count : diff->new_count;
+
+	if (diff->phase == PHASE_HEAD) {
+		if (scan_head(diff, shared))
+			return true;
+		diff->phase = PHASE_TAIL;
+	}
+	if (diff->phase == PHASE_TAIL) {
+		if (scan_tail(diff, shared))
+			return true;
+		if (diff->head + diff->tail == diff->old_count && diff->head + diff->tail == diff->new_count) {
+			diff->phase = PHASE_DONE;
+			return false;
+		}
+		match_middle(diff);
+		diff->phase = PHASE_ADDED;
+	}
+	return next_matched(diff);
 }

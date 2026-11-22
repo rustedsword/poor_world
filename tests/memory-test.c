@@ -130,9 +130,11 @@ held_versions_keep_their_memory(void)
 	shrink();
 	drain(&t, &p);
 	assert(p.outstanding > (base + peak) / 2);
+	assert(poor_world_stats(&t).versions == 2);
 	validate(poor_world_held(&t, &hold));
 	poor_world_release(&t, &hold);
 	poor_world_reclaim(&t);
+	assert(poor_world_stats(&t).versions == 1);
 	drain(&t, &p);
 	assert(p.outstanding <= base + SLAB);
 	finish();
