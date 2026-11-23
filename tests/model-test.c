@@ -179,7 +179,7 @@ static uint32_t
 slot_of(const struct item *parent, const struct item *child)
 {
 	for (uint32_t i = 0; i < parent->node.child_count; i++) {
-		if (poor_world_child(TREE, parent, i) == child)
+		if (tree_child(parent, i) == child)
 			return i;
 	}
 	assert(false);
@@ -190,7 +190,7 @@ static uint32_t
 slot_of_id(const struct item *parent, uint64_t id)
 {
 	for (uint32_t i = 0; i < parent->node.child_count; i++) {
-		if (poor_world_child(TREE, parent, i)->node.id == id)
+		if (tree_child(parent, i)->node.id == id)
 			return i;
 	}
 	return UINT32_MAX;
@@ -219,24 +219,24 @@ check_children(struct poor_world_diff_scratch *scratch, const struct item *old, 
 
 	assert(old_marks != nullptr && new_marks != nullptr && run != nullptr && from != nullptr);
 	++diffs;
-	poor_world_diff_begin(TREE, &diff, scratch, old, next, false);
-	while (poor_world_diff_next(&diff)) {
-		const struct item *o = poor_world_diff_old(TREE, &diff), *n = poor_world_diff_new(TREE, &diff);
+	tree_diff_begin(&diff, scratch, old, next, false);
+	while (tree_diff_next(&diff)) {
+		const struct item *o = tree_diff_old(&diff), *n = tree_diff_new(&diff);
 
 		++yields;
 		if (o == nullptr) {
-			assert(!poor_world_diff_moved(&diff) && slot_of_id(old, n->node.id) == UINT32_MAX);
+			assert(!tree_diff_moved(&diff) && slot_of_id(old, n->node.id) == UINT32_MAX);
 			assert(new_marks[slot_of(next, n)] == MARK_NONE);
 			new_marks[slot_of(next, n)] = MARK_ALONE;
 		} else if (n == nullptr) {
-			assert(!poor_world_diff_moved(&diff) && slot_of_id(next, o->node.id) == UINT32_MAX);
+			assert(!tree_diff_moved(&diff) && slot_of_id(next, o->node.id) == UINT32_MAX);
 			assert(old_marks[slot_of(old, o)] == MARK_NONE);
 			old_marks[slot_of(old, o)] = MARK_ALONE;
 		} else {
-			assert(o->node.id == n->node.id && (poor_world_diff_moved(&diff) || o != n));
+			assert(o->node.id == n->node.id && (tree_diff_moved(&diff) || o != n));
 			assert(old_marks[slot_of(old, o)] == MARK_NONE && new_marks[slot_of(next, n)] == MARK_NONE);
-			old_marks[slot_of(old, o)] = new_marks[slot_of(next, n)] = poor_world_diff_moved(&diff) ? MARK_MOVED : MARK_STABLE;
-			if (!poor_world_diff_moved(&diff)) {
+			old_marks[slot_of(old, o)] = new_marks[slot_of(next, n)] = tree_diff_moved(&diff) ? MARK_MOVED : MARK_STABLE;
+			if (!tree_diff_moved(&diff)) {
 				++nested;
 				check_pair(scratch, o, n);
 			}
@@ -245,7 +245,7 @@ check_children(struct poor_world_diff_scratch *scratch, const struct item *old, 
 	assert(scratch->top == top);
 
 	for (uint32_t j = 0; j < new_count; j++) {
-		const struct item *n = poor_world_child(TREE, next, j);
+		const struct item *n = tree_child(next, j);
 		uint32_t i;
 
 		if (new_marks[j] == MARK_ALONE)
@@ -253,7 +253,7 @@ check_children(struct poor_world_diff_scratch *scratch, const struct item *old, 
 		i = slot_of_id(old, n->node.id);
 		assert(i != UINT32_MAX);
 		if (new_marks[j] == MARK_NONE) {
-			assert(poor_world_child(TREE, old, i) == n && old_marks[i] == MARK_NONE);
+			assert(tree_child(old, i) == n && old_marks[i] == MARK_NONE);
 			old_marks[i] = new_marks[j] = MARK_SAME;
 		}
 		from[common++] = i;
@@ -299,23 +299,23 @@ check_diff(const struct snapshot *old, const struct snapshot *next)
 	const uint32_t match_count = old->version.node_count + next->version.node_count;
 	uint32_t *slots = malloc((slot_count + 1) * sizeof(*slots));
 	struct poor_world_diff_match *matches = malloc((match_count + 1) * sizeof(*matches));
-	const struct item *a = poor_world_root(TREE, old), *b = poor_world_root(TREE, next);
+	const struct item *a = tree_root(old), *b = tree_root(next);
 	struct poor_world_diff_scratch scratch;
 	struct poor_world_diff diff;
 	uint32_t all = 0;
 
 	assert(slots != nullptr && matches != nullptr);
-	poor_world_diff_scratch_init(&scratch, slot_count, slots, match_count, matches);
+	tree_diff_scratch_init(&scratch, slot_count, slots, match_count, matches);
 	if (a != nullptr && b != nullptr && a->node.id == b->node.id) {
 		check_pair(&scratch, a, b);
-		poor_world_diff_begin(TREE, &diff, &scratch, a, b, true);
-		while (poor_world_diff_next(&diff))
-			all += poor_world_diff_new(TREE, &diff) != nullptr;
+		tree_diff_begin(&diff, &scratch, a, b, true);
+		while (tree_diff_next(&diff))
+			all += tree_diff_new(&diff) != nullptr;
 		assert(all == b->node.child_count);
-		poor_world_diff_begin(TREE, &diff, &scratch, a, b, true);
-		if (poor_world_diff_next(&diff))
-			poor_world_diff_stop(&diff);
-		assert(!poor_world_diff_next(&diff));
+		tree_diff_begin(&diff, &scratch, a, b, true);
+		if (tree_diff_next(&diff))
+			tree_diff_stop(&diff);
+		assert(!tree_diff_next(&diff));
 	}
 	assert(scratch.top == 0);
 	for (uint32_t i = 0; i < slot_count; i++)
@@ -341,7 +341,7 @@ main(void)
 	struct poor_world_pin pins[READERS];
 	uint64_t aborted = 0;
 
-	poor_world_init(&t, 4096)->tag = 0;
+	tree_init(&t, 4096)->tag = 0;
 	p = (struct provider)PROVIDER_INIT;
 	for (uint32_t i = 0; i < READERS; i++) {
 		holds[i] = (struct poor_world_hold)POOR_WORLD_HOLD_INIT;
@@ -354,68 +354,68 @@ main(void)
 		uint32_t reader = (uint32_t)(rng() % READERS);
 		const struct snapshot *held;
 
-		poor_world_begin(&t)->tag = transaction;
-		collect(poor_world_next(&t));
+		tree_begin(&t)->tag = transaction;
+		collect(tree_next(&t));
 		for (uint32_t i = 0; i < ops; i++) {
 			const struct op op = pick_op(&t, 250);
 
 			perform(&op);
-			collect(poor_world_next(&t));
+			collect(tree_next(&t));
 		}
 		if (rng() % 150 == 0 && live_count != 0) {
 			const struct op wide = { .kind = OP_CREATE, .parent = live[rng() % live_count], .value = 1 };
 
 			for (uint32_t i = 0; i < 700; i++)
 				perform(&wide);
-			collect(poor_world_next(&t));
+			collect(tree_next(&t));
 		}
-		assert(hash_of(poor_world_next(&t)) == model_hash(&model));
-		validate(poor_world_next(&t));
-		check_index(&t, poor_world_next(&t));
+		assert(hash_of(tree_next(&t)) == model_hash(&model));
+		validate(tree_next(&t));
+		check_index(&t, tree_next(&t));
 		if (abort_it) {
-			poor_world_abort(&t);
+			tree_abort(&t);
 			model_free(&model);
 			model = saved;
 			++aborted;
-			check_index(&t, poor_world_current(&t));
+			check_index(&t, tree_current(&t));
 		} else {
-			poor_world_publish(&t);
-			epoch_hash[poor_world_current(&t)->version.epoch] = model_hash(&model);
+			tree_publish(&t);
+			epoch_hash[tree_current(&t)->version.epoch] = model_hash(&model);
 		}
-		assert(hash_of(poor_world_current(&t)) == epoch_hash[poor_world_current(&t)->version.epoch]);
+		assert(hash_of(tree_current(&t)) == epoch_hash[tree_current(&t)->version.epoch]);
 
 		if (rng() % 3 == 0)
-			poor_world_pin(&t, &holds[reader], &pins[reader]);
-		held = poor_world_latest(&t, &holds[reader]);
+			tree_pin(&t, &holds[reader], &pins[reader]);
+		held = tree_latest(&t, &holds[reader]);
 		assert(hash_of(held) == epoch_hash[held->version.epoch]);
 		reader = (uint32_t)(rng() % READERS);
-		if (poor_world_pinned(&t, &pins[reader]) != nullptr) {
-			const struct snapshot *old = poor_world_pinned(&t, &pins[reader]);
+		if (tree_pinned(&t, &pins[reader]) != nullptr) {
+			const struct snapshot *old = tree_pinned(&t, &pins[reader]);
 
 			assert(hash_of(old) == epoch_hash[old->version.epoch]);
 			validate(old);
-			check_diff(old, poor_world_current(&t));
+			check_diff(old, tree_current(&t));
 			if (rng() % 4 == 0)
-				poor_world_unpin(&t, &pins[reader]);
+				tree_unpin(&t, &pins[reader]);
 		}
 		if (rng() % 5 == 0)
-			poor_world_release(&t, &holds[(uint32_t)(rng() % READERS)]);
+			tree_release(&t, &holds[(uint32_t)(rng() % READERS)]);
 		if (rng() % 7 == 0)
-			poor_world_reclaim(&t);
+			tree_reclaim(&t);
 		if (rng() % 40 == 0)
 			drain(&t, &p);
 	}
 	for (uint32_t i = 0; i < READERS; i++) {
-		poor_world_release(&t, &holds[i]);
-		poor_world_unpin(&t, &pins[i]);
+		tree_release(&t, &holds[i]);
+		tree_unpin(&t, &pins[i]);
 	}
-	poor_world_reclaim(&t);
-	assert(poor_world_stats(&t).versions == 1 && poor_world_stats(&t).nodes == poor_world_current(&t)->version.node_count);
-	println("epoch ", poor_world_current(&t)->version.epoch, ", aborted ", aborted, ", nodes ",
-		poor_world_current(&t)->version.node_count, ", diffs ", diffs, ", yields ", yields, ", nested ", nested);
+	tree_reclaim(&t);
+	assert(tree_stats(&t).versions == 1 && tree_stats(&t).nodes == tree_current(&t)->version.node_count);
+	println("epoch ", tree_current(&t)->version.epoch, ", aborted ", aborted, ", nodes ",
+		tree_current(&t)->version.node_count, ", diffs ", diffs, ", yields ", yields, ", nested ", nested);
 	assert(diffs > TRANSACTIONS && nested > TRANSACTIONS / 4);
 	model_free(&model);
-	poor_world_fini(&t);
+	tree_fini(&t);
 	drain(&t, &p);
 	assert(p.outstanding == 0);
 	return 0;

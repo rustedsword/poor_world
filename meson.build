@@ -20,7 +20,6 @@ add_project_arguments(
 		'-Wstrict-prototypes',
 		'-Wmissing-prototypes',
 		'-Wundef',
-		'-fvisibility=hidden',
 		# Array views of no elements are variable length arrays of zero length
 		'-fno-sanitize=vla-bound',
 	]),
@@ -34,9 +33,22 @@ else
 	poor_base_dep = subproject('poor_base').get_variable('poor_base_dep')
 endif
 
-inc = include_directories('include')
+poor_world_dep = declare_dependency(
+	include_directories: include_directories('include'),
+	dependencies: poor_base_dep,
+)
+meson.override_dependency('poor_world', poor_world_dep)
 
-subdir('src')
+install_headers('include/poor_world.h')
+
+pkgconfig.generate(
+	name: 'poor_world',
+	description: 'Versioned tree for one writer and many readers, without allocations',
+	version: meson.project_version(),
+	filebase: 'poor_world',
+	requires: [ 'poor_base' ],
+	install_dir: get_option('datadir') / 'pkgconfig',
+)
 
 if get_option('tests')
 	subdir('tests')

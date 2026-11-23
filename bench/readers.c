@@ -20,6 +20,7 @@ struct frame {
 };
 
 poor_world_declare(scene, struct window, node, struct frame, version, MAX_READERS + 2);
+poor_world_define(scene);
 
 enum phase : int {
 	PHASE_WAIT,
@@ -117,12 +118,12 @@ stay_on(uint32_t cpu)
 static void
 feed(void)
 {
-	const size_t bytes = poor_world_wanted(&s);
+	const size_t bytes = scene_wanted(&s);
 	void *memory = aligned_alloc(SLAB, bytes);
 
 	if (memory == nullptr)
 		abort();
-	poor_world_feed(&s, memory, bytes);
+	scene_feed(&s, memory, bytes);
 }
 
 static uint32_t
@@ -130,7 +131,7 @@ create(uint32_t parent)
 {
 	struct window *window;
 
-	while ((window = poor_world_create(&s, parent, 0)) == nullptr)
+	while ((window = scene_create(&s, parent, 0)) == nullptr)
 		feed();
 	window->x = window->y = 0;
 	return window->node.handle;
@@ -141,11 +142,11 @@ publish(void)
 {
 	struct window *window;
 
-	poor_world_begin(&s);
-	while ((window = poor_world_edit(&s, child)) == nullptr)
+	scene_begin(&s);
+	while ((window = scene_edit(&s, child)) == nullptr)
 		feed();
 	++window->x;
-	poor_world_publish(&s);
+	scene_publish(&s);
 }
 
 static void *
@@ -161,16 +162,16 @@ read_versions(void *argument)
 		;
 	start = bench_now();
 	while (atomic_load_explicit(&phase, memory_order_relaxed) == PHASE_RUN) {
-		const struct frame *frame = poor_world_latest(&s, &hold);
+		const struct frame *frame = scene_latest(&s, &hold);
 
 		versions += frame->version.epoch != epoch;
 		epoch = frame->version.epoch;
 		if (reader->lets_go)
-			poor_world_release(&s, &hold);
+			scene_release(&s, &hold);
 		++calls;
 	}
 	reader->ns = bench_now() - start;
-	poor_world_release(&s, &hold);
+	scene_release(&s, &hold);
 	reader->calls = calls;
 	reader->versions = versions;
 	return nullptr;
@@ -206,7 +207,7 @@ run(uint32_t count, bool lets_go, bool publishing)
 		ns += readers[i].ns;
 		seen += readers[i].versions;
 	}
-	poor_world_reclaim(&s);
+	scene_reclaim(&s);
 	return (struct result){
 		.call_ps = calls != 0 ? ns * 1000 / calls : 0,
 		.publish_ns = published != 0 ? spent / published : 0,
@@ -274,17 +275,17 @@ main(void)
 	printf("%7s  %-24s  %-24s  %-24s  %-24s  %s\n", "readers", "latest()", "latest() and release()", "latest()",
 	       "publish()", "versions a reader saw");
 
-	poor_world_init(&s, SLAB);
-	poor_world_begin(&s);
+	scene_init(&s, SLAB);
+	scene_begin(&s);
 	child = create(create(POOR_WORLD_NO_HANDLE));
-	poor_world_publish(&s);
+	scene_publish(&s);
 
 	foreach_array_ref(counts, count) {
 		if (*count < core_count)
 			measure(*count);
 	}
-	poor_world_fini(&s);
-	for (void *memory; (memory = poor_world_take(&s, &bytes)) != nullptr;)
+	scene_fini(&s);
+	for (void *memory; (memory = scene_take(&s, &bytes)) != nullptr;)
 		free(memory);
 	return 0;
 }

@@ -30,21 +30,21 @@ collect_node(const struct item *item)
 	assert(live_count < LIVE_MAX);
 	live[live_count++] = item->node.handle;
 	for (uint32_t i = 0; i < item->node.child_count; i++)
-		collect_node(poor_world_child(TREE, item, i));
+		collect_node(tree_child(item, i));
 }
 
 [[maybe_unused]] static void
 collect(const struct snapshot *s)
 {
 	live_count = 0;
-	if (poor_world_root(TREE, s) != nullptr)
-		collect_node(poor_world_root(TREE, s));
+	if (tree_root(s) != nullptr)
+		collect_node(tree_root(s));
 }
 
 static bool
 inside(tree *t, uint32_t handle, uint32_t ancestor)
 {
-	for (; handle != POOR_WORLD_NO_HANDLE; handle = poor_world_parent(t, handle)) {
+	for (; handle != POOR_WORLD_NO_HANDLE; handle = tree_parent(t, handle)) {
 		if (handle == ancestor)
 			return true;
 	}
@@ -66,14 +66,14 @@ pick_op(tree *t, uint32_t limit)
 	op.parent = live[rng() % live_count];
 	if (roll < (live_count < limit ? 45u : 15u)) {
 		op.kind = OP_CREATE;
-		op.index = (uint32_t)(rng() % (poor_world_node(t, op.parent)->node.child_count + 1));
-	} else if (roll < 52 && (poor_world_parent(t, op.handle) != POOR_WORLD_NO_HANDLE || rng() % 50 == 0)) {
+		op.index = (uint32_t)(rng() % (tree_node(t, op.parent)->node.child_count + 1));
+	} else if (roll < 52 && (tree_parent(t, op.handle) != POOR_WORLD_NO_HANDLE || rng() % 50 == 0)) {
 		op.kind = OP_DESTROY;
-	} else if (roll < 80 && poor_world_parent(t, op.handle) != POOR_WORLD_NO_HANDLE && !inside(t, op.parent, op.handle)) {
-		const uint32_t count = poor_world_node(t, op.parent)->node.child_count;
+	} else if (roll < 80 && tree_parent(t, op.handle) != POOR_WORLD_NO_HANDLE && !inside(t, op.parent, op.handle)) {
+		const uint32_t count = tree_node(t, op.parent)->node.child_count;
 
 		op.kind = OP_MOVE;
-		op.index = (uint32_t)(rng() % (poor_world_parent(t, op.handle) == op.parent ? count : count + 1));
+		op.index = (uint32_t)(rng() % (tree_parent(t, op.handle) == op.parent ? count : count + 1));
 	} else {
 		op.kind = OP_EDIT;
 	}
@@ -89,7 +89,7 @@ try_op(tree *t, const struct op *op, uint32_t *created)
 
 	switch (op->kind) {
 	case OP_CREATE:
-		item = poor_world_create(t, op->parent, op->index);
+		item = tree_create(t, op->parent, op->index);
 		if (item == nullptr)
 			return false;
 		item->value = op->value;
@@ -98,14 +98,14 @@ try_op(tree *t, const struct op *op, uint32_t *created)
 		lift(t, item->node.handle, op->value);
 		return true;
 	case OP_DESTROY:
-		sum = poor_world_node(t, op->handle)->sum;
-		origin = poor_world_parent(t, op->handle);
-		if (!poor_world_destroy(t, op->handle))
+		sum = tree_node(t, op->handle)->sum;
+		origin = tree_parent(t, op->handle);
+		if (!tree_destroy(t, op->handle))
 			return false;
 		lift(t, origin, -sum);
 		return true;
 	case OP_EDIT:
-		item = poor_world_edit(t, op->handle);
+		item = tree_edit(t, op->handle);
 		if (item == nullptr)
 			return false;
 		sum = op->value - item->value;
@@ -113,9 +113,9 @@ try_op(tree *t, const struct op *op, uint32_t *created)
 		lift(t, op->handle, sum);
 		return true;
 	case OP_MOVE:
-		sum = poor_world_node(t, op->handle)->sum;
-		origin = poor_world_parent(t, op->handle);
-		if (!poor_world_move(t, op->handle, op->parent, op->index))
+		sum = tree_node(t, op->handle)->sum;
+		origin = tree_parent(t, op->handle);
+		if (!tree_move(t, op->handle, op->parent, op->index))
 			return false;
 		if (origin != op->parent) {
 			lift(t, origin, -sum);

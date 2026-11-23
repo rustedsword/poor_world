@@ -29,11 +29,11 @@ changes_between(struct poor_world_diff_scratch *scratch, const struct item *old,
 	uint64_t changes = 1;
 
 	assert(old->node.id == next->node.id);
-	poor_world_diff_begin(TREE, &diff, scratch, old, next, false);
-	while (poor_world_diff_next(&diff)) {
-		const struct item *o = poor_world_diff_old(TREE, &diff), *n = poor_world_diff_new(TREE, &diff);
+	tree_diff_begin(&diff, scratch, old, next, false);
+	while (tree_diff_next(&diff)) {
+		const struct item *o = tree_diff_old(&diff), *n = tree_diff_new(&diff);
 
-		if (o != nullptr && n != nullptr && !poor_world_diff_moved(&diff))
+		if (o != nullptr && n != nullptr && !tree_diff_moved(&diff))
 			changes += changes_between(scratch, o, n);
 		else
 			++changes;
@@ -50,10 +50,10 @@ read_versions(void *argument)
 	struct poor_world_diff_scratch scratch;
 	uint64_t epoch = 0;
 
-	poor_world_diff_scratch_init(&scratch, SLOTS, reader->slots, SLOTS, reader->matches);
+	tree_diff_scratch_init(&scratch, SLOTS, reader->slots, SLOTS, reader->matches);
 	while (!atomic_load_explicit(&stop, memory_order_relaxed)) {
-		const struct snapshot *latest = poor_world_latest(&t, &hold);
-		const struct snapshot *old = poor_world_pinned(&t, &pin);
+		const struct snapshot *latest = tree_latest(&t, &hold);
+		const struct snapshot *old = tree_pinned(&t, &pin);
 		const struct snapshot copy = *latest;
 
 		assert(latest->version.epoch >= epoch && latest->tag == latest->version.epoch);
@@ -62,29 +62,29 @@ read_versions(void *argument)
 		epoch = latest->version.epoch;
 		validate(latest);
 		assert(copy.version.epoch == epoch && copy.version.node_count == latest->version.node_count);
-		if (poor_world_root(TREE, latest) != nullptr) {
-			const struct item root = *poor_world_root(TREE, latest);
+		if (tree_root(latest) != nullptr) {
+			const struct item root = *tree_root(latest);
 
-			assert(root.sum == poor_world_root(TREE, &copy)->sum && root.node.id == poor_world_root(TREE, latest)->node.id);
+			assert(root.sum == tree_root(&copy)->sum && root.node.id == tree_root(latest)->node.id);
 		}
 		if (old != nullptr) {
 			assert(old->version.epoch <= epoch);
 			validate(old);
-			if (old != latest && poor_world_root(TREE, old) != nullptr && poor_world_root(TREE, latest) != nullptr
-			    && poor_world_root(TREE, old)->node.id == poor_world_root(TREE, latest)->node.id)
-				reader->changes += changes_between(&scratch, poor_world_root(TREE, old), poor_world_root(TREE, latest));
+			if (old != latest && tree_root(old) != nullptr && tree_root(latest) != nullptr
+			    && tree_root(old)->node.id == tree_root(latest)->node.id)
+				reader->changes += changes_between(&scratch, tree_root(old), tree_root(latest));
 			assert(scratch.top == 0);
 		}
 		reader->seed ^= reader->seed << 13;
 		reader->seed ^= reader->seed >> 7;
 		reader->seed ^= reader->seed << 17;
 		if (reader->seed % 4 == 0)
-			poor_world_pin(&t, &hold, &pin);
+			tree_pin(&t, &hold, &pin);
 		if (reader->seed % 16 == 1)
-			poor_world_release(&t, &hold);
+			tree_release(&t, &hold);
 	}
-	poor_world_release(&t, &hold);
-	poor_world_unpin(&t, &pin);
+	tree_release(&t, &hold);
+	tree_unpin(&t, &pin);
 	return nullptr;
 }
 
@@ -93,7 +93,7 @@ main(void)
 {
 	uint64_t versions = 0, changes = 0;
 
-	poor_world_init(&t, 4096)->tag = 0;
+	tree_init(&t, 4096)->tag = 0;
 	p = (struct provider)PROVIDER_INIT;
 	for (uint32_t i = 0; i < READERS; i++) {
 		readers[i].seed = UINT64_C(0x9e3779b97f4a7c15) * (i + 1);
@@ -101,7 +101,7 @@ main(void)
 	}
 	for (uint32_t transaction = 0; transaction < TRANSACTIONS; transaction++) {
 		const uint32_t ops = (uint32_t)(1 + rng() % 4);
-		struct snapshot *next = poor_world_begin(&t);
+		struct snapshot *next = tree_begin(&t);
 
 		next->tag = next->version.epoch;
 		collect(next);
@@ -114,12 +114,12 @@ main(void)
 			collect(next);
 		}
 		if (rng() % 10 == 0) {
-			poor_world_abort(&t);
+			tree_abort(&t);
 		} else {
-			poor_world_publish(&t);
+			tree_publish(&t);
 		}
 		if (rng() % 32 == 0) {
-			poor_world_reclaim(&t);
+			tree_reclaim(&t);
 			drain(&t, &p);
 		}
 	}
@@ -129,10 +129,10 @@ main(void)
 		versions += readers[i].versions;
 		changes += readers[i].changes;
 	}
-	poor_world_reclaim(&t);
-	assert(poor_world_stats(&t).versions == 1 && poor_world_stats(&t).nodes == poor_world_current(&t)->version.node_count);
+	tree_reclaim(&t);
+	assert(tree_stats(&t).versions == 1 && tree_stats(&t).nodes == tree_current(&t)->version.node_count);
 	assert(versions > READERS && changes > 0);
-	poor_world_fini(&t);
+	tree_fini(&t);
 	drain(&t, &p);
 	assert(p.outstanding == 0);
 	return 0;
